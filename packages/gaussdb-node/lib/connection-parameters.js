@@ -6,6 +6,8 @@ const defaults = require('./defaults')
 
 const parse = require('gaussdb-connection-string').parse // parses a connection string
 
+const HostSpec = require('./host-spec')
+
 const val = function (key, config, envVar) {
   if (envVar === undefined) {
     envVar = process.env['GAUSS' + key.toUpperCase()]
@@ -122,6 +124,113 @@ class ConnectionParameters {
     if (typeof config.keepAliveInitialDelayMillis === 'number') {
       this.keepalives_idle = Math.floor(config.keepAliveInitialDelayMillis / 1000)
     }
+
+    // Parse multi-host configuration
+    this.hosts = this._parseHosts(config)
+
+    // Parse loadBalanceHosts parameter and map to mode
+    this.loadBalanceMode = this._parseLoadBalanceMode(config)
+
+    // Parse targetServerType parameter
+    this.targetServerType = val('targetServerType', config)
+
+    // Parse hostRecheckSeconds parameter
+    const hostRecheckSeconds = val('hostRecheckSeconds', config)
+    this.hostRecheckSeconds =
+      typeof hostRecheckSeconds === 'number' ? hostRecheckSeconds : parseInt(hostRecheckSeconds, 10)
+  }
+
+  /**
+   * Parse hosts configuration from multiple sources
+   * Priority: config.hosts > connectionString parsed hosts > config.host/port arrays > config.host/port single
+   * @param {object} config - Configuration object
+   * @returns {HostSpec[]} Array of HostSpec instances
+   * @private
+   */
+  _parseHosts(config) {
+    const hosts = []
+
+    // Priority 1: config.hosts (array of {host, port} objects)
+    if (config.hosts && Array.isArray(config.hosts)) {
+      for (const hostInfo of config.hosts) {
+        const host = hostInfo.host || 'localhost'
+        const port = hostInfo.port || this.port || defaults.port
+        hosts.push(new HostSpec(host, port))
+      }
+      return hosts
+    }
+
+    // Priority 2: connectionString parsed hosts (already in config from parse())
+    // This is already handled by the connection string parser
+
+    // Priority 3: config.host and config.port as arrays
+    if (Array.isArray(config.host)) {
+      const hostArray = config.host
+      const portArray = Array.isArray(config.port) ? config.port : []
+      const defaultPort = this.port || defaults.port
+
+      for (let i = 0; i < hostArray.length; i++) {
+        const host = hostArray[i]
+        const port = portArray[i] || defaultPort
+        hosts.push(new HostSpec(host, port))
+      }
+      return hosts
+    }
+
+    // Priority 4: Single host/port (backward compatibility)
+    if (this.host) {
+      hosts.push(new HostSpec(this.host, this.port))
+    }
+
+    return hosts
+  }
+
+  /**
+   * Parse and map loadBalanceHosts parameter value
+   * Maps JDBC autoBalance values to Node.js loadBalanceMode
+   * @param {object} config - Configuration object
+   * @returns {string|boolean} Parsed load balance mode
+   * @private
+   */
+  _parseLoadBalanceMode(config) {
+    const rawValue = val('loadBalanceHosts', config)
+
+    // Handle boolean values
+    if (rawValue === true || rawValue === 'true' || rawValue === '1') {
+      return 'roundrobin' // true maps to roundrobin mode
+    }
+
+    if (rawValue === false || rawValue === 'false' || rawValue === '0' || rawValue === undefined) {
+      return false // false means no load balancing
+    }
+
+    // Handle string values
+    if (typeof rawValue === 'string') {
+      const normalizedValue = rawValue.toLowerCase()
+
+      // roundrobin mode
+      if (normalizedValue === 'roundrobin' || normalizedValue === 'balance') {
+        return 'roundrobin'
+      }
+
+      // shuffle mode
+      if (normalizedValue === 'shuffle') {
+        return 'shuffle'
+      }
+
+      // leastconn mode
+      if (normalizedValue === 'leastconn') {
+        return 'leastconn'
+      }
+
+      // priority mode
+      if (normalizedValue.startsWith('priority')) {
+        return normalizedValue // Return as-is, e.g., 'priority2'
+      }
+    }
+
+    // Default: no load balancing
+    return false
   }
 
   getLibpqConnectionString(cb) {

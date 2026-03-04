@@ -447,4 +447,66 @@ describe('parse', function () {
     const subject = parse(connectionString)
     subject.port?.should.equal('1234')
   })
+
+  it('parses multiple hosts with per-host ports and fallback default', function () {
+    const subject = parse('gaussdb://node1:5433,node2,node3:5434/mydb')
+    subject.host?.should.equal('node1')
+    subject.port?.should.equal(5433)
+    subject.database?.should.equal('mydb')
+    subject.hosts?.should.deep.equal([
+      { host: 'node1', port: 5433 },
+      { host: 'node2', port: 5432 },
+      { host: 'node3', port: 5434 },
+    ])
+  })
+
+  it('parses multiple hosts and uses the last host port as default', function () {
+    const subject = parse('gaussdb://node1,node2,node3:5439/mydb')
+    subject.host?.should.equal('node1')
+    subject.port?.should.equal(5439)
+    subject.database?.should.equal('mydb')
+    subject.hosts?.should.deep.equal([
+      { host: 'node1', port: 5439 },
+      { host: 'node2', port: 5439 },
+      { host: 'node3', port: 5439 },
+    ])
+  })
+
+  it('handles empty multi-host list by falling back to default port', function () {
+    const subject = parse('gaussdb://,,/mydb')
+    subject.host?.should.equal('')
+    subject.port?.should.equal(5432)
+    subject.database?.should.equal('mydb')
+  })
+
+  it('converts loadBalanceHosts query parameter to boolean true', function () {
+    parse('gaussdb://localhost/mydb?loadBalanceHosts=true').loadBalanceHosts?.should.equal(true)
+    parse('gaussdb://localhost/mydb?loadBalanceHosts=1').loadBalanceHosts?.should.equal(true)
+  })
+
+  it('converts loadBalanceHosts query parameter to boolean false', function () {
+    parse('gaussdb://localhost/mydb?loadBalanceHosts=false').loadBalanceHosts?.should.equal(false)
+    parse('gaussdb://localhost/mydb?loadBalanceHosts=0').loadBalanceHosts?.should.equal(false)
+  })
+
+  it('supports multi-host URL without pathname suffix', function () {
+    const subject = parse('gaussdb://node1,node2')
+    subject.host?.should.equal('node1')
+    subject.port?.should.equal(5432)
+    ;(subject.database === null).should.equal(true)
+  })
+
+  it('keeps query host when parsed multi-host list is empty', function () {
+    const subject = parse('gaussdb://,,/mydb?host=override-host')
+    subject.host?.should.equal('override-host')
+    subject.database?.should.equal('mydb')
+  })
+
+  it('parseMultipleHosts returns empty list for empty input', function () {
+    parse.parseMultipleHosts(undefined, 5432).should.deep.equal([])
+  })
+
+  it('parseMultipleHosts uses default port for invalid host port', function () {
+    parse.parseMultipleHosts('node1:not-a-port', 5432).should.deep.equal([{ host: 'node1', port: 5432 }])
+  })
 })

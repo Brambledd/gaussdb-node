@@ -70,6 +70,24 @@ module.exports = {
   keepalives: 1,
 
   keepalives_idle: 0,
+
+  // load balancing mode for multi-host connections
+  // false: no load balancing (default)
+  // true/'roundrobin'/'balance': round-robin mode
+  // 'shuffle': random mode
+  // 'leastconn': least connection mode
+  // 'priority[n]': priority round-robin mode
+  loadBalanceHosts: false,
+
+  // target server type for connections
+  // 'any': connect to any node (default)
+  // 'master': connect to master node only
+  // 'slave': connect to slave node only
+  // 'preferSlave': prefer slave node, fallback to master if no slave available
+  targetServerType: 'any',
+
+  // host status recheck interval in seconds
+  hostRecheckSeconds: 10,
 }
 
 const pgTypes = require('pg-types')

@@ -5,6 +5,41 @@
 //Copyright (c) 2025 happy-game
 //MIT License
 
+/**
+ * Parse multiple hosts from hostname string
+ * @param {string} hostnameString - Comma-separated host:port string
+ * @param {number} defaultPort - Default port to use if not specified
+ * @returns {Array<{host: string, port: number}>} Array of host specs
+ */
+function parseMultipleHosts(hostnameString, defaultPort) {
+  const hostTokens = (hostnameString || '')
+    .split(',')
+    .map((token) => token.trim())
+    .filter((token) => token.length > 0)
+
+  if (hostTokens.length === 0) return []
+
+  return hostTokens.map((token) => {
+    const colonIndex = token.indexOf(':')
+
+    // Check if there's a port specification (host:port)
+    if (colonIndex > 0) {
+      const host = token.substring(0, colonIndex)
+      const port = parseInt(token.substring(colonIndex + 1), 10)
+      return {
+        host: decodeURIComponent(host),
+        port: port || defaultPort,
+      }
+    }
+
+    // No port specified
+    return {
+      host: decodeURIComponent(token),
+      port: defaultPort,
+    }
+  })
+}
+
 //parses a connection string
 function parse(str, options = {}) {
   //unix socket
@@ -18,6 +53,43 @@ function parse(str, options = {}) {
   const config = {}
   let result
   let dummyHost = false
+  let multiHostString = null
+  let extractedPort = null
+
+  // Extract multi-host format BEFORE URL encoding
+  // Match pattern: gaussdb://[user:pass@]host1[:port1],host2[:port2],.../database
+  const multiHostMatch = str.match(/^(gaussdb:\/\/(?:[^@]+@)?)([^/?]+)(\/.*)?$/)
+  if (multiHostMatch && multiHostMatch[2] && multiHostMatch[2].includes(',')) {
+    multiHostString = multiHostMatch[2]
+
+    // Determine the default port by checking if only the last host has a port
+    // e.g., "node1,node2,node3:5433" -> default port is 5433
+    // e.g., "node1:5432,node2:5433" -> default port is 5432 (standard)
+    const hostParts = multiHostString.split(',')
+    let hasMultiplePortSpecifications = false
+    let lastPartPort = null
+
+    for (let i = 0; i < hostParts.length; i++) {
+      const part = hostParts[i].trim()
+      const colonIndex = part.indexOf(':')
+      const hasPort = colonIndex > 0
+
+      if (hasPort && i < hostParts.length - 1) {
+        hasMultiplePortSpecifications = true
+        break
+      }
+      if (hasPort && i === hostParts.length - 1) {
+        lastPartPort = part.substring(colonIndex + 1)
+      }
+    }
+
+    // If only last part has port, use it as default; otherwise use 5432
+    extractedPort = !hasMultiplePortSpecifications && lastPartPort ? lastPartPort : '5432'
+
+    // Replace with placeholder host
+    str = multiHostMatch[1] + '__MULTI_HOST_PLACEHOLDER__' + (multiHostMatch[3] || '')
+  }
+
   if (/ |%[^a-f0-9]|%[a-f0-9][^a-f0-9]/i.test(str)) {
     // Ensure spaces are encoded as %20
     str = encodeURI(str).replace(/%25(\d\d)/g, '%$1')
@@ -60,6 +132,28 @@ function parse(str, options = {}) {
 
   const pathname = result.pathname.slice(1) || null
   config.database = pathname ? decodeURI(pathname) : null
+
+  // Parse multiple hosts if we extracted multi-host string
+  if (multiHostString) {
+    const defaultPort = parseInt(extractedPort, 10)
+    const hosts = parseMultipleHosts(multiHostString, defaultPort)
+    if (hosts.length > 0) {
+      config.hosts = hosts
+      // Set first host as default for backward compatibility
+      config.host = hosts[0].host
+      config.port = hosts[0].port
+    } else if (config.host === '__MULTI_HOST_PLACEHOLDER__') {
+      config.host = ''
+      config.port = defaultPort
+    }
+  }
+
+  // Parse loadBalanceHosts parameter
+  if (config.loadBalanceHosts === 'true' || config.loadBalanceHosts === '1') {
+    config.loadBalanceHosts = true
+  } else if (config.loadBalanceHosts === 'false' || config.loadBalanceHosts === '0') {
+    config.loadBalanceHosts = false
+  }
 
   if (config.ssl === 'true' || config.ssl === '1') {
     config.ssl = true
@@ -205,5 +299,6 @@ function parseIntoClientConfig(str) {
 module.exports = parse
 
 parse.parse = parse
+parse.parseMultipleHosts = parseMultipleHosts
 parse.toClientConfig = toClientConfig
 parse.parseIntoClientConfig = parseIntoClientConfig

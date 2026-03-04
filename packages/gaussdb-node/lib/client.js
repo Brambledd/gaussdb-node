@@ -10,6 +10,9 @@ const Query = require('./query')
 const defaults = require('./defaults')
 const Connection = require('./connection')
 const crypto = require('./crypto/utils')
+const HostChooser = require('./host-chooser')
+const HostStatusTracker = require('./host-status-tracker')
+const HostStatus = HostStatusTracker.HostStatus
 
 class Client extends EventEmitter {
   constructor(config) {
@@ -44,15 +47,15 @@ class Client extends EventEmitter {
     this._queryable = true
 
     this.enableChannelBinding = Boolean(c.enableChannelBinding) // set true to use SCRAM-SHA-256-PLUS when offered
-    this.connection =
-      c.connection ||
-      new Connection({
-        stream: c.stream,
-        ssl: this.connectionParameters.ssl,
-        keepAlive: c.keepAlive || false,
-        keepAliveInitialDelayMillis: c.keepAliveInitialDelayMillis || 0,
-        encoding: this.connectionParameters.client_encoding || 'utf8',
-      })
+    this._connectionOptions = {
+      stream: c.stream,
+      ssl: this.connectionParameters.ssl,
+      keepAlive: c.keepAlive || false,
+      keepAliveInitialDelayMillis: c.keepAliveInitialDelayMillis || 0,
+      encoding: this.connectionParameters.client_encoding || 'utf8',
+    }
+    this._clientProvidedConnection = Boolean(c.connection)
+    this.connection = c.connection || new Connection(this._connectionOptions)
     this.queryQueue = []
     this.binary = c.binary || defaults.binary
     this.processID = null
@@ -68,6 +71,8 @@ class Client extends EventEmitter {
     }
 
     this._connectionTimeoutMillis = c.connectionTimeoutMillis || 0
+    this._connectErrorHandler = null
+    this._activeHostSpec = null
   }
 
   _errorAllQueries(err) {
@@ -87,8 +92,6 @@ class Client extends EventEmitter {
   }
 
   _connect(callback) {
-    const self = this
-    const con = this.connection
     this._connectionCallback = callback
 
     if (this._connecting || this._connected) {
@@ -102,14 +105,38 @@ class Client extends EventEmitter {
 
     if (this._connectionTimeoutMillis > 0) {
       this.connectionTimeoutHandle = setTimeout(() => {
-        con._ending = true
-        con.stream.destroy(new Error('timeout expired'))
+        const activeConnection = this.connection
+        if (activeConnection) {
+          activeConnection._ending = true
+          if (activeConnection.stream) {
+            activeConnection.stream.destroy(new Error('timeout expired'))
+          }
+        }
       }, this._connectionTimeoutMillis)
 
       if (this.connectionTimeoutHandle.unref) {
         this.connectionTimeoutHandle.unref()
       }
     }
+
+    const params = this.connectionParameters
+    const hasHosts = Array.isArray(params.hosts) && params.hosts.length > 0
+    const loadBalanceEnabled = Boolean(params.loadBalanceMode)
+    const isDomainSocket = this.host && this.host.indexOf('/') === 0
+
+    if (hasHosts && loadBalanceEnabled && !isDomainSocket) {
+      this._connectWithLoadBalance()
+    } else if (hasHosts && !loadBalanceEnabled && !isDomainSocket) {
+      this._setActiveHost(params.hosts[0])
+      this._startConnection()
+    } else {
+      this._startConnection()
+    }
+  }
+
+  _startConnection() {
+    const self = this
+    const con = this.connection
 
     if (this.host && this.host.indexOf('/') === 0) {
       // TODO: is GaussDB using domain sockets?
@@ -133,8 +160,16 @@ class Client extends EventEmitter {
 
     this._attachListeners(con)
 
+    const activeConnection = con
     con.once('end', () => {
+      if (activeConnection !== this.connection) {
+        return
+      }
       const error = this._ending ? new Error('Connection terminated') : new Error('Connection terminated unexpectedly')
+
+      if (this._connecting && this._connectErrorHandler) {
+        return this._connectErrorHandler(error)
+      }
 
       clearTimeout(this.connectionTimeoutHandle)
       this._errorAllQueries(error)
@@ -162,6 +197,92 @@ class Client extends EventEmitter {
     })
   }
 
+  _setActiveHost(hostSpec) {
+    if (!hostSpec) {
+      return
+    }
+    this.host = hostSpec.host
+    this.port = hostSpec.port
+    this._activeHostSpec = hostSpec
+
+    if (this.connectionParameters) {
+      this.connectionParameters.host = hostSpec.host
+      this.connectionParameters.port = hostSpec.port
+    }
+  }
+
+  _connectWithLoadBalance() {
+    const params = this.connectionParameters
+    const chooser = new HostChooser(
+      params.hosts,
+      params.loadBalanceMode,
+      params.targetServerType,
+      params.hostRecheckSeconds
+    )
+    const orderedHosts = Array.from(chooser.getHostIterator())
+
+    if (orderedHosts.length === 0) {
+      return this._finalizeConnectFailure(new Error('No hosts to connect'))
+    }
+
+    if (this._clientProvidedConnection) {
+      orderedHosts.splice(1)
+    }
+
+    let lastError = null
+
+    const tryNextHost = () => {
+      const hostSpec = orderedHosts.shift()
+      if (!hostSpec) {
+        return this._finalizeConnectFailure(lastError || new Error('No hosts to connect'))
+      }
+
+      this._connectionError = false
+      this._setActiveHost(hostSpec)
+
+      if (!this._clientProvidedConnection) {
+        this.connection = new Connection(this._connectionOptions)
+      }
+
+      this._connectErrorHandler = (err) => {
+        if (this._connectionError) {
+          return
+        }
+        this._connectionError = true
+        lastError = err
+        HostStatusTracker.updateHostStatus(hostSpec, HostStatus.CONNECT_FAIL)
+
+        if (this.connection && this.connection.stream) {
+          this.connection.stream.destroy()
+        }
+
+        if (this._clientProvidedConnection) {
+          return this._finalizeConnectFailure(lastError)
+        }
+
+        process.nextTick(tryNextHost)
+      }
+
+      this._startConnection()
+    }
+
+    tryNextHost()
+  }
+
+  _finalizeConnectFailure(err) {
+    this._connectErrorHandler = null
+    this._connecting = false
+    this._connectionError = true
+    clearTimeout(this.connectionTimeoutHandle)
+
+    if (this._connectionCallback) {
+      const callback = this._connectionCallback
+      this._connectionCallback = null
+      return callback(err)
+    }
+    this.emit('error', err)
+  }
+
   connect(callback) {
     if (callback) {
       this._connect(callback)
@@ -180,6 +301,10 @@ class Client extends EventEmitter {
   }
 
   _attachListeners(con) {
+    const handleError = (err) => this._handleErrorEvent(err, con)
+    const handleErrorMessage = (msg) => this._handleErrorMessage(msg, con)
+    const handleReadyForQuery = (msg) => this._handleReadyForQuery(msg, con)
+
     // password request handling
     con.on('authenticationCleartextPassword', this._handleAuthCleartextPassword.bind(this))
     // password request handling
@@ -191,9 +316,9 @@ class Client extends EventEmitter {
     con.on('authenticationSASLContinue', this._handleAuthSASLContinue.bind(this))
     con.on('authenticationSASLFinal', this._handleAuthSASLFinal.bind(this))
     con.on('backendKeyData', this._handleBackendKeyData.bind(this))
-    con.on('error', this._handleErrorEvent.bind(this))
-    con.on('errorMessage', this._handleErrorMessage.bind(this))
-    con.on('readyForQuery', this._handleReadyForQuery.bind(this))
+    con.on('error', handleError)
+    con.on('errorMessage', handleErrorMessage)
+    con.on('readyForQuery', handleReadyForQuery)
     con.on('notice', this._handleNotice.bind(this))
     con.on('rowDescription', this._handleRowDescription.bind(this))
     con.on('dataRow', this._handleDataRow.bind(this))
@@ -313,11 +438,19 @@ class Client extends EventEmitter {
     this.secretKey = msg.secretKey
   }
 
-  _handleReadyForQuery(msg) {
+  _handleReadyForQuery(msg, connection) {
+    if (connection && connection !== this.connection) {
+      return
+    }
     if (this._connecting) {
       this._connecting = false
       this._connected = true
       clearTimeout(this.connectionTimeoutHandle)
+      this._connectErrorHandler = null
+
+      if (this._activeHostSpec) {
+        HostStatusTracker.updateHostStatus(this._activeHostSpec, HostStatus.CONNECT_OK)
+      }
 
       // process possible callback argument to Client#connect
       if (this._connectionCallback) {
@@ -340,6 +473,9 @@ class Client extends EventEmitter {
   // if we receieve an error event or error message
   // during the connection process we handle it here
   _handleErrorWhileConnecting(err) {
+    if (this._connectErrorHandler) {
+      return this._connectErrorHandler(err)
+    }
     if (this._connectionError) {
       // TODO(bmc): this is swallowing errors - we shouldn't do this
       return
@@ -363,7 +499,10 @@ class Client extends EventEmitter {
   // if we're connected and we receive an error event from the connection
   // this means the socket is dead - do a hard abort of all queries and emit
   // the socket error on the client as well
-  _handleErrorEvent(err) {
+  _handleErrorEvent(err, connection) {
+    if (connection && connection !== this.connection) {
+      return
+    }
     if (this._connecting) {
       return this._handleErrorWhileConnecting(err)
     }
@@ -373,7 +512,10 @@ class Client extends EventEmitter {
   }
 
   // handle error messages from the postgres backend
-  _handleErrorMessage(msg) {
+  _handleErrorMessage(msg, connection) {
+    if (connection && connection !== this.connection) {
+      return
+    }
     if (this._connecting) {
       return this._handleErrorWhileConnecting(msg)
     }

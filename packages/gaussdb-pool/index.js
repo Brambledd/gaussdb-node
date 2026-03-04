@@ -1,5 +1,7 @@
 'use strict'
 const EventEmitter = require('events').EventEmitter
+const ConnectionParameters = require('../gaussdb-node/lib/connection-parameters')
+const HostChooser = require('../gaussdb-node/lib/host-chooser')
 
 const NOOP = function () {}
 
@@ -106,6 +108,27 @@ class Pool extends EventEmitter {
     this._endCallback = undefined
     this.ending = false
     this.ended = false
+
+    // Multi-host load balancing support
+    // Track which host each client is connected to
+    this._clientHostMap = new WeakMap()
+    this._hostChooser = null
+    this._isMultiHost = false
+    this._loadBalanceMode = false
+
+    // Initialize HostChooser for multi-host load balancing
+    const params = new ConnectionParameters(this.options)
+    this._isMultiHost = Array.isArray(params.hosts) && params.hosts.length > 1
+    this._loadBalanceMode = params.loadBalanceMode
+
+    if (this._isMultiHost && this._loadBalanceMode) {
+      this._hostChooser = new HostChooser(
+        params.hosts,
+        params.loadBalanceMode,
+        params.targetServerType,
+        params.hostRecheckSeconds
+      )
+    }
   }
 
   _isFull() {
@@ -145,20 +168,55 @@ class Pool extends EventEmitter {
     if (!this._idle.length && this._isFull()) {
       return
     }
+
+    // Select target host for multi-host load balancing
+    let targetHostSpec = null
+    if (this._isMultiHost && this._hostChooser) {
+      const iterator = this._hostChooser.getHostIterator()
+      const first = iterator.next()
+      if (!first.done) {
+        targetHostSpec = first.value
+        this.log('selected target host:', targetHostSpec.toString())
+      }
+    }
+
     const pendingItem = this._pendingQueue.shift()
+
+    // Try to find idle client for target host
+    let idleItem = null
     if (this._idle.length) {
-      const idleItem = this._idle.pop()
-      clearTimeout(idleItem.timeoutId)
-      const client = idleItem.client
+      idleItem = this._findIdleClientForHost(targetHostSpec)
+      if (idleItem) {
+        clearTimeout(idleItem.timeoutId)
+        const client = idleItem.client
+        client.ref && client.ref()
+        const idleListener = idleItem.idleListener
+
+        return this._acquireClient(client, pendingItem, idleListener, false)
+      }
+    }
+
+    // If no suitable idle client but pool not full, create new connection
+    if (!this._isFull()) {
+      return this.newClient(pendingItem, targetHostSpec)
+    }
+
+    // Pool full and no idle client for target host
+    // Fallback: use any available idle client to avoid request starvation
+    if (this._idle.length > 0) {
+      this.log('Pool full, no idle client for target host, using fallback client')
+      const fallbackItem = this._idle.pop()
+      clearTimeout(fallbackItem.timeoutId)
+      const client = fallbackItem.client
       client.ref && client.ref()
-      const idleListener = idleItem.idleListener
+      const idleListener = fallbackItem.idleListener
 
       return this._acquireClient(client, pendingItem, idleListener, false)
     }
-    if (!this._isFull()) {
-      return this.newClient(pendingItem)
-    }
-    throw new Error('unexpected condition')
+
+    // No idle clients at all, wait for any connection to be released
+    this._pendingQueue.unshift(pendingItem)
+    this.log('Pool full, no idle clients available, waiting...')
   }
 
   _remove(client) {
@@ -169,6 +227,10 @@ class Pool extends EventEmitter {
     }
 
     this._clients = this._clients.filter((c) => c !== client)
+
+    // Remove from host tracking
+    this._clientHostMap.delete(client)
+
     client.end()
     this.emit('remove', client)
   }
@@ -223,10 +285,18 @@ class Pool extends EventEmitter {
     return result
   }
 
-  newClient(pendingItem) {
-    const client = new this.Client(this.options)
+  newClient(pendingItem, targetHostSpec = null) {
+    // If targetHostSpec provided, create single-host config
+    const clientConfig = targetHostSpec ? this._configWithHost(targetHostSpec) : this.options
+
+    const client = new this.Client(clientConfig)
     this._clients.push(client)
     const idleListener = makeIdleListener(this, client)
+
+    // Track which host this client will connect to
+    if (targetHostSpec) {
+      this._clientHostMap.set(client, targetHostSpec)
+    }
 
     this.log('checking client timeout')
 
@@ -252,6 +322,10 @@ class Pool extends EventEmitter {
         this.log('client failed to connect', err)
         // remove the dead client from our list of clients
         this._clients = this._clients.filter((c) => c !== client)
+
+        // Remove from host map
+        this._clientHostMap.delete(client)
+
         if (timeoutHit) {
           err = new Error('Connection terminated due to connection timeout', { cause: err })
         }
@@ -264,6 +338,11 @@ class Pool extends EventEmitter {
         }
       } else {
         this.log('new client connected')
+
+        // Update host map with actual connected host
+        if (!targetHostSpec && client._activeHostSpec) {
+          this._clientHostMap.set(client, client._activeHostSpec)
+        }
 
         if (this.options.maxLifetimeSeconds !== 0) {
           const maxLifetimeTimeout = setTimeout(() => {
@@ -442,6 +521,66 @@ class Pool extends EventEmitter {
       }
     })
     return response.result
+  }
+
+  /**
+   * Find an idle client connected to the specified host
+   * @param {HostSpec|null} targetHostSpec - Target host specification
+   * @returns {IdleItem|null} Idle item for the target host, or null if not found
+   * @private
+   */
+  _findIdleClientForHost(targetHostSpec) {
+    if (!targetHostSpec) {
+      // No target host specified (single-host or no load balancing)
+      // Use existing LIFO behavior (pop from end)
+      return this._idle.length > 0 ? this._idle.pop() : null
+    }
+
+    // Multi-host load balancing: find idle client for specific host
+    for (let i = this._idle.length - 1; i >= 0; i--) {
+      const idleItem = this._idle[i]
+      const clientHost = this._clientHostMap.get(idleItem.client)
+
+      if (clientHost && this._hostsEqual(clientHost, targetHostSpec)) {
+        // Found idle client for target host - remove from idle array
+        return this._idle.splice(i, 1)[0]
+      }
+    }
+
+    return null
+  }
+
+  /**
+   * Compare two HostSpec objects for equality
+   * @param {HostSpec} hostSpec1 - First host spec
+   * @param {HostSpec} hostSpec2 - Second host spec
+   * @returns {boolean} True if both host and port are equal
+   * @private
+   */
+  _hostsEqual(hostSpec1, hostSpec2) {
+    if (!hostSpec1 || !hostSpec2) return false
+    return hostSpec1.host === hostSpec2.host && hostSpec1.port === hostSpec2.port
+  }
+
+  /**
+   * Create a config object for a single-host connection
+   * @param {HostSpec} targetHostSpec - Target host specification
+   * @returns {object} Config object with host overridden
+   * @private
+   */
+  _configWithHost(targetHostSpec) {
+    // Create shallow copy preserving non-enumerable properties
+    const config = Object.create(Object.getPrototypeOf(this.options))
+    Object.defineProperties(config, Object.getOwnPropertyDescriptors(this.options))
+
+    // Override host and port for this specific connection
+    config.host = targetHostSpec.host
+    config.port = targetHostSpec.port
+
+    config.loadBalanceHosts = false
+    config.hosts = undefined
+
+    return config
   }
 
   end(cb) {
