@@ -294,7 +294,7 @@ export class Parser {
         fields[i] = null
       } else {
         const format = this._fieldFormats[i] || 'text'
-        fields[i] = len === -1 ? null : this.reader.string(len)
+        fields[i] = format === 'binary' ? this.reader.bytes(len) : this.reader.string(len)
       }      
     }
     return new DataRowMessage(length, fields)
