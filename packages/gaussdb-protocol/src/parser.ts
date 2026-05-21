@@ -82,6 +82,7 @@ export class Parser {
   private bufferOffset: number = 0
   private reader = new BufferReader()
   private mode: Mode
+  private _fieldFormats: ('text' | 'binary')[] = []
 
   constructor(opts?: StreamOptions) {
     if (opts?.mode === 'binary') {
@@ -252,8 +253,11 @@ export class Parser {
     this.reader.setBuffer(offset, bytes)
     const fieldCount = this.reader.int16()
     const message = new RowDescriptionMessage(length, fieldCount)
+    this._fieldFormats = []
     for (let i = 0; i < fieldCount; i++) {
-      message.fields[i] = this.parseField()
+      const field = this.parseField()
+      message.fields[i] = field
+      this._fieldFormats.push(field.format)
     }
     return message
   }
@@ -286,7 +290,12 @@ export class Parser {
     for (let i = 0; i < fieldCount; i++) {
       const len = this.reader.int32()
       // a -1 for length means the value of the field is null
-      fields[i] = len === -1 ? null : this.reader.string(len)
+      if (len === -1) {
+        fields[i] = null
+      } else {
+        const format = this._fieldFormats[i] || 'text'
+        fields[i] = len === -1 ? null : this.reader.string(len)
+      }      
     }
     return new DataRowMessage(length, fields)
   }
