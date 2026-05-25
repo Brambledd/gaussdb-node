@@ -337,23 +337,28 @@ export class Parser {
           return new AuthenticationMD5Password(length, salt)
         }
         break
-      // case 10: // AuthenticationSASL
-      //   {
-      //     message.name = 'authenticationSASL'
-      //     message.mechanisms = []
-      //     let mechanism: string
-      //     do {
-      //       mechanism = this.reader.cstring()
-      //       if (mechanism) {
-      //         message.mechanisms.push(mechanism)
-      //       }
-      //     } while (mechanism)
-      //   }
-      //   break
-      case 10: // AuthenticationSHA256Password
+      // case 10: // AuthenticationSASL or AuthenticationSHA256Password
+      // GaussDB uses authType=10 for SHA256 authentication
+      // Postgres uses authType=10 for SASL/SCRAM authentication
+      // Distinguish by checking if the first byte after authType is printable ASCII
+      case 10: 
         {
-          message.name = 'authenticationSHA256Password'
-          message.data = this.reader.bytes(length - 8)
+          const peekByte = this.reader.peekByte() 
+          if (peekByte >= 0x20 && peekByte <= 0x7e) {
+            message.name = 'authenticationSASL'
+            message.mechanisms = []
+            let mechanism: string
+            do {
+              mechanism = this.reader.cstring()
+              if (mechanism) {
+                message.mechanisms.push(mechanism)
+              }
+            } while (mechanism)
+          } else {
+            //GaussDB SHA256: raw bytes (method +random_code + token +iteration)
+            message.name = 'authenticationSHA256Password'
+            message.data = this.reader.bytes(length - 8)
+          }
         }
         break
       case 11: // AuthenticationSASLContinue
