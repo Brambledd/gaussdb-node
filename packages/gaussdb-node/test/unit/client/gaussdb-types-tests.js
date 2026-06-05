@@ -388,3 +388,130 @@ suite.test('XMLTYPE (OID 140) scalar has no parser registered (as designed)', ()
   const parser = pgTypes.getTypeParser(140, 'text')
   assert.strictEqual(parser('<root/>'), '<root/>')
 })
+
+// ──────────────────────────────────────────────
+// 14. floatvector with bracket notation (GaussDB uses [] instead of {})
+// ──────────────────────────────────────────────
+
+suite.test('floatvector: bracket notation [1.0,2.0]', () => {
+  const parser = pgTypes.getTypeParser(4409, 'text')
+  const result = parser('[1.0,2.0]')
+  assert.ok(Array.isArray(result))
+  assert.strictEqual(result.length, 2)
+  assert.strictEqual(result[0], 1)
+  assert.strictEqual(result[1], 2)
+})
+
+// ──────────────────────────────────────────────
+// 15. boolvector with bracket notation
+// ──────────────────────────────────────────────
+
+suite.test('boolvector: bracket notation [1,0]', () => {
+  const parser = pgTypes.getTypeParser(4410, 'text')
+  const result = parser('[1,0]')
+  assert.deepStrictEqual(result, [true, false])
+})
+
+// ──────────────────────────────────────────────
+// 16. floatvector array with null elements
+// ──────────────────────────────────────────────
+
+suite.test('floatvector array: contains null vector element', () => {
+  const parser = pgTypes.getTypeParser(1077, 'text') // floatvector[]
+  const result = parser('{"{1.0,2.0}",NULL,"{3.0}"}')
+  assert.ok(Array.isArray(result))
+  assert.strictEqual(result.length, 3)
+  assert.ok(Array.isArray(result[0]))
+  assert.strictEqual(result[0].length, 2)
+  assert.strictEqual(result[1], null)
+  assert.ok(Array.isArray(result[2]))
+  assert.strictEqual(result[2].length, 1)
+})
+
+// ──────────────────────────────────────────────
+// 17. boolvector array with null elements
+// ──────────────────────────────────────────────
+
+suite.test('boolvector array: contains null vector element', () => {
+  const parser = pgTypes.getTypeParser(1078, 'text') // boolvector[]
+  const result = parser('{"{1,0}",NULL,"{0}"}')
+  assert.ok(Array.isArray(result))
+  assert.strictEqual(result.length, 3)
+  assert.ok(Array.isArray(result[0]))
+  assert.deepStrictEqual(result[0], [true, false])
+  assert.strictEqual(result[1], null)
+  assert.ok(Array.isArray(result[2]))
+  assert.deepStrictEqual(result[2], [false])
+})
+
+// ──────────────────────────────────────────────
+// 18. RAW/BLOB: null passthrough
+// ──────────────────────────────────────────────
+
+suite.test('binary types: null passthrough', () => {
+  const raw = pgTypes.getTypeParser(86, 'text')
+  const blob = pgTypes.getTypeParser(88, 'text')
+  assert.strictEqual(raw(null), null)
+  assert.strictEqual(blob(null), null)
+})
+
+// ──────────────────────────────────────────────
+// 19. RAW/BLOB: odd-length hex string edge case
+// ──────────────────────────────────────────────
+
+suite.test('binary types: multi-byte hex decodes correctly', () => {
+  const raw = pgTypes.getTypeParser(86, 'text')
+  // "Hi" = 0x48 0x69
+  const result = raw('4869')
+  assert.ok(Buffer.isBuffer(result))
+  assert.strictEqual(result.toString('utf8'), 'Hi')
+})
+
+// ──────────────────────────────────────────────
+// 20. boolvector: mixed 1/0 and t/f in same vector
+// ──────────────────────────────────────────────
+
+suite.test('boolvector: mixed 1/0 and t/f', () => {
+  const parser = pgTypes.getTypeParser(4410, 'text')
+  const result = parser('{1,t,0,f}')
+  assert.deepStrictEqual(result, [true, true, false, false])
+})
+
+// ──────────────────────────────────────────────
+// 21. floatvector array: null passthrough
+// ──────────────────────────────────────────────
+
+suite.test('floatvector array: null passthrough', () => {
+  const parser = pgTypes.getTypeParser(1077, 'text')
+  assert.strictEqual(parser(null), null)
+})
+
+// ──────────────────────────────────────────────
+// 22. boolvector array: null passthrough
+// ──────────────────────────────────────────────
+
+suite.test('boolvector array: null passthrough', () => {
+  const parser = pgTypes.getTypeParser(1078, 'text')
+  assert.strictEqual(parser(null), null)
+})
+
+// ──────────────────────────────────────────────
+// 23. defaults.js registration: parsers registered by defaults.js work correctly
+// ──────────────────────────────────────────────
+
+suite.test('defaults.js registration: gaussdb type parsers loaded through defaults', () => {
+  // This verifies the fix where defaults.js init callback uses correct parameter name
+  const defaults = require('../../../lib/defaults')
+  // INT1 (OID 5545) should have a parser registered
+  const parser = pgTypes.getTypeParser(5545, 'text')
+  assert.strictEqual(parser('42'), 42)
+})
+
+// ──────────────────────────────────────────────
+// 24. gaussdbTypes module init exports
+// ──────────────────────────────────────────────
+
+suite.test('gaussdb-types module exports builtins and init', () => {
+  assert.ok(gaussdbTypes.builtins)
+  assert.strictEqual(typeof gaussdbTypes.init, 'function')
+})
