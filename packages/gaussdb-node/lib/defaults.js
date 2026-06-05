@@ -94,8 +94,8 @@ const pgTypes = require('pg-types')
 const gaussdbTypeParsers = require('./gaussdb-types')
 
 //Register GaussDB-specific type parsers
-gaussdbTypeParsers.init(function (old, converter) {
-  pgTypes.setTypeParser(outerWidth, 'text', converter)
+gaussdbTypeParsers.init(function (oid, converter) {
+  pgTypes.setTypeParser(oid, 'text', converter)
 })
 
 // save default parsers

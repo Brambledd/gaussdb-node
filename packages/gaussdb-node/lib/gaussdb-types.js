@@ -105,7 +105,7 @@ var init = function (register) {
     register(9003, parseDate)
     register(1116, parseDate)
     register(4409, parseFloatVector)
-    register(4410, parseFloatVector)
+    register(4410, parseBoolVector)
     register(1072, parseIntegerArray)
     register(1073, parseIntegerArray)
     register(1074, parseIntegerArray)
