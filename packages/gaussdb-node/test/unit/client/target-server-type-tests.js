@@ -235,7 +235,9 @@ test('unsupported frontend protocol fallback', function () {
     client._connecting = true
     client._connectionError = false
 
-    client._handleErrorWhileConnecting(new Error('FATAL: unsupported frontend protocol 3.51. server told us to go away'))
+    client._handleErrorWhileConnecting(
+      new Error('FATAL: unsupported frontend protocol 3.51. server told us to go away')
+    )
 
     assert.strictEqual(startCalls, 1)
     assert.strictEqual(client._protocolFallbackAttempted, true)
