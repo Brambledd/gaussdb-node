@@ -462,7 +462,7 @@ class Client extends EventEmitter {
             return
           }
           const isInRecovery = result && result.rows && result.rows[0] ? result.rows[0].is_in_recovery : null
-          const role = 
+          const role =
             isInRecovery === true || isInRecovery === 't'
               ? HostStatus.SLAVE
               : isInRecovery === false || isInRecovery === 'f'
